@@ -1,0 +1,4 @@
+*.o
+*.so
+*.pre.cpp
+test-app
