@@ -1,0 +1,165 @@
+#!/usr/bin/perl -w
+use strict;
+use warnings;
+
+use Carp;
+use Math::BigInt;
+
+use autodie qw( :all );
+
+# How many entries need to be processed before dot is printed.
+my $dotThreshold = 10000;
+
+# Unbuffer stdout.
+select( ( select( STDOUT ), $| = 1 )[0] );
+
+# State map.
+my %classes = ();
+my %methods = ();
+my %objects = ();
+
+# Returns number of instances of given class.
+sub getInstanceCount {
+  my ( $class ) = @_;
+  my $p = $class->{INSTANCES};
+  if( defined $p ) {
+    return scalar keys %{$p};
+  } else {
+    return 0;
+  }
+}
+
+# Function that writes a snapshot.
+my $firstSnapshot = undef;
+open my $sh, '>', 'analyze.out';
+sub takeSnapshot {
+  my ( $time ) = @_;
+  if( defined $firstSnapshot ) {
+    $time -= $firstSnapshot;
+  } else {
+    $firstSnapshot = $time;
+    $time = 0;
+  }
+
+  print $sh "snapshot ${time}\n";
+  my @classes = sort { getInstanceCount( $b ) <=> getInstanceCount( $a ) }
+                     ( grep { $_->{COMPLETE} } ( values %classes ) );
+  foreach my $class ( @classes ) {
+    print $sh ( "  " . $class->{NAME} . " " . getInstanceCount( $class ) . "\n" );
+  }
+  print $sh "\n";
+}
+
+# Constants.
+my $allocatingCtor = 'A';
+my $completeCtor = 'B';
+my $baseCtor = 'C';
+my $deallocatingDtor = 'a';
+my $completeDtor = 'b';
+my $baseDtor = 'c';
+
+# Parse command line.
+my $file = shift or confess 'Please specify input file';
+
+# Analyze input file.
+open my $fh, '<', $file;
+my $dotTrigger = 0;
+my $snapshotTrigger = 0;
+my $maxClassId = 0;
+while( defined( my $s = <$fh> ) ) {
+  chomp( $fh );
+  # Parse entry.
+  if( $s =~ /^([Mm]) 0x([0-9a-f]{8}) 0x([0-9a-f]{8}) (.+)$/ ) {
+    # Module loaded/unloaded.
+    my ( $action, $start, $end, $name ) = ( $1, hex( $2 ), hex( $3 ), $4 );
+  } elsif( $s =~ /^([AaBbCc]) 0x([0-9a-f]{8}) (.+)$/ ) {
+    # Method wrapped.
+    my ( $type, $address, $className ) = ( $1, hex( $2 ), $3 );
+
+    # Locate class.
+    my $class = $classes{$className};
+    unless( defined $class ) {
+      $class = { NAME => $className, ID => $maxClassId++ };
+      $classes{$className} = $class;
+    }
+
+    # Locate method.
+    my $method = $methods{$address};
+    unless( defined $method ) {
+      $method = { ADDRESS => $address, TYPE => $type };
+      $methods{$address} = $method;
+    }
+
+    # Associate method with class.
+    if( defined( my $currentClass = $method->{CLASS} ) ) {
+      if( $currentClass != $class ) {
+        confess "Method already associated with another class: ${s}";
+      }
+    } else {
+      $method->{CLASS} = $class;
+    }
+    if( defined( my $currentMethod = $class->{$type}->{$address} ) ) {
+      if( $currentMethod != $method ) {
+        my $msg = sprintf(
+          "Class already has another method of type %s at address 0x%.8x: %s",
+          $type,
+          $address,
+          $s );
+        confess $msg;
+      }
+    } else {
+      $class->{$type}->{$address} = $method;
+    }
+
+    # Check whether class has at least one constructor and at least one destructor.
+    my $hasCtor = defined $class->{$allocatingCtor} ||
+                  defined $class->{$completeCtor} ||
+                  defined $class->{$baseCtor};
+    my $hasDtor = defined $class->{$deallocatingDtor} ||
+                  defined $class->{$completeDtor} ||
+                  defined $class->{$baseDtor};
+    $class->{COMPLETE} = $hasCtor && $hasDtor;
+  } elsif( $s =~ /^X 0x([0-9a-f]{8}) 0x([0-9a-f]{8})$/ ) {
+    # Method invoked.
+    my ( $address, $argument ) = ( hex( $1 ), hex( $2 ) );
+
+    # Find method data.
+    my $method = $methods{$address};
+    unless( defined $method ) {
+      confess "Unknown method invoked: ${s}";
+    }
+
+    # Find class data.
+    my $class = $method->{CLASS};
+    unless( defined $class ) {
+      confess "Method has no associated class: ${s}";
+    }
+
+    # Update state (ignore incomplete classes)
+    if( $class->{COMPLETE} ) {
+      if( $method->{TYPE} eq $allocatingCtor ||
+          $method->{TYPE} eq $completeCtor ||
+          $method->{TYPE} eq $baseCtor ) {
+        $class->{INSTANCES}->{$argument} = 1;
+      } else {
+        delete $class->{INSTANCES}->{$argument};
+      }
+    }
+  } elsif( $s =~ /^T (0x[0-9a-f]{16})$/ ) {
+    my $timeText = $1;
+    my $time = Math::BigInt->from_hex( $timeText );
+    takeSnapshot( $time );
+  } else {
+    confess "Unexpected line: ${s}";
+  }
+
+  # Print dot to indicate progress if necessary.
+  $dotTrigger++;
+  if( $dotTrigger == $dotThreshold ) {
+    print '.';
+    $dotTrigger = 0;
+  }
+}
+close $fh;
+
+print "\n";
